@@ -113,6 +113,31 @@ is_valid_ipv4() {
   return 0
 }
 
+detect_access_host() {
+  # Явное переопределение от пользователя
+  if [ -n "${PUBLIC_HOST_IP:-}" ]; then
+    echo "${PUBLIC_HOST_IP}"
+    return 0
+  fi
+
+  # Основной способ: исходный адрес до внешней сети
+  local detected_ip=""
+  if command -v ip >/dev/null 2>&1; then
+    detected_ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
+  fi
+
+  # Fallback: первый IPv4 адрес хоста (кроме loopback)
+  if [ -z "$detected_ip" ] && command -v hostname >/dev/null 2>&1; then
+    detected_ip="$(hostname -I 2>/dev/null | tr ' ' '\n' | awk '/^[0-9]+\./ && $1 !~ /^127\./ {print; exit}')"
+  fi
+
+  if [ -n "$detected_ip" ] && is_valid_ipv4 "$detected_ip"; then
+    echo "$detected_ip"
+  else
+    echo "localhost"
+  fi
+}
+
 ask_yes_no() { # ask_yes_no "Вопрос?" "N"
   local prompt="$1" default="${2:-N}" ans
   read -rp "$prompt [y/N]: " ans || true
@@ -440,14 +465,14 @@ json_array_find_id_by_name() {
 wait_mongo_ready() {
   local container_name="${1:-unicnetmongo}" tries="${2:-30}" sleep_s="${3:-2}"
   local i=0
+  local mongo_cli="mongo"
+  if docker exec "$container_name" sh -c "command -v mongosh >/dev/null 2>&1" >/dev/null 2>&1; then
+    mongo_cli="mongosh"
+  fi
   while (( i < tries )); do
-    # Пробуем простую проверку ping без аутентификации
-    if docker exec "$container_name" mongo --eval "db.adminCommand('ping')" >/dev/null 2>&1; then
-      return 0
-    fi
-    # Альтернативная проверка: пытаемся подключиться к порту
-    if docker exec "$container_name" sh -c "nc -z localhost 27017" >/dev/null 2>&1; then
-      sleep 1  # Даем немного времени на полную инициализацию
+    # Проверяем доступность Mongo shell внутри контейнера и ping БД
+    if docker exec "$container_name" sh -c "command -v ${mongo_cli} >/dev/null 2>&1" >/dev/null 2>&1 \
+      && docker exec "$container_name" "$mongo_cli" --quiet --eval "db.adminCommand({ ping: 1 })" >/dev/null 2>&1; then
       return 0
     fi
     printf "."; sleep "$sleep_s"; i=$((i+1))
@@ -560,6 +585,10 @@ step_create_mongo_users_and_dbs() {
   echo
   
   log "Создаю базы данных и пользователей в MongoDB"
+  local mongo_cli="mongo"
+  if docker exec "$container_name" sh -c "command -v mongosh >/dev/null 2>&1" >/dev/null 2>&1; then
+    mongo_cli="mongosh"
+  fi
   
   # Создаем или обновляем пользователей и БД через MongoDB команды
   create_mongo_user() {
@@ -630,7 +659,7 @@ EOF
     }
     
     local output exit_code
-    output="$(docker exec "${container_name}" mongo admin -u "${MONGO_ROOT_USER}" -p "${MONGO_ROOT_PASS}" --authenticationDatabase admin --quiet /tmp/create_user_${username}.js 2>&1)" || exit_code=$?
+    output="$(docker exec "${container_name}" "$mongo_cli" admin -u "${MONGO_ROOT_USER}" -p "${MONGO_ROOT_PASS}" --authenticationDatabase admin --quiet /tmp/create_user_${username}.js 2>&1)" || exit_code=$?
     
     docker exec "${container_name}" rm -f "/tmp/create_user_${username}.js" >/dev/null 2>&1 || true
     rm -f "$temp_script"
@@ -651,9 +680,15 @@ EOF
   }
   
   # Создаем всех пользователей
-  create_mongo_user "${MONGO_UNICNET_DB}" "${MONGO_UNICNET_USER}" "${MONGO_UNICNET_PASS}" || true
-  create_mongo_user "${MONGO_LOGGER_DB}" "${MONGO_LOGGER_USER}" "${MONGO_LOGGER_PASS}" || true
-  create_mongo_user "${MONGO_VAULT_DB}" "${MONGO_VAULT_USER}" "${MONGO_VAULT_PASS}" || true
+  local mongo_create_failed=0
+  create_mongo_user "${MONGO_UNICNET_DB}" "${MONGO_UNICNET_USER}" "${MONGO_UNICNET_PASS}" || mongo_create_failed=1
+  create_mongo_user "${MONGO_LOGGER_DB}" "${MONGO_LOGGER_USER}" "${MONGO_LOGGER_PASS}" || mongo_create_failed=1
+  create_mongo_user "${MONGO_VAULT_DB}" "${MONGO_VAULT_USER}" "${MONGO_VAULT_PASS}" || mongo_create_failed=1
+
+  if [ "$mongo_create_failed" -ne 0 ]; then
+    err "Не удалось создать/обновить одного или нескольких пользователей MongoDB"
+    return 1
+  fi
   
   log "Базы данных и пользователи MongoDB успешно созданы:"
   info "  - ${MONGO_UNICNET_DB} (пользователь: ${MONGO_UNICNET_USER})"
@@ -748,8 +783,16 @@ step_get_vault_token() {
       token_extracted="$(echo "$response_body" | sed -n 's/.*"value"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
     fi
     
+    if [ -z "$token_extracted" ]; then
+      token_extracted="$(echo "$response_body" | sed -n 's/.*"data"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+    fi
     if [ -z "$token_extracted" ] || [ "$token_extracted" = "null" ] || [ "$token_extracted" = "empty" ]; then
-      token_extracted="$(echo "$response_body" | sed 's/^[[:space:]]*"//;s/"[[:space:]]*$//;s/^[[:space:]]*//;s/[[:space:]]*$//' | tr -d '\n')"
+      # fallback только для plain-string ответа, но не для JSON-объекта
+      local compact_body
+      compact_body="$(echo "$response_body" | tr -d '\n\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+      if [[ "$compact_body" != \{* ]] && [[ "$compact_body" != \[* ]]; then
+        token_extracted="$(echo "$compact_body" | sed 's/^"//;s/"$//')"
+      fi
     fi
     
     if [ -n "$token_extracted" ] && [ "$token_extracted" != "null" ] && [ "$token_extracted" != "empty" ]; then
@@ -934,23 +977,9 @@ step_detect_kc_port() {
     env_port="$(grep -E '^KEYCLOAK_PORT=' "$envf" | tail -1 | cut -d= -f2)"
   fi
 
-  # Определяем IP адрес для доступа к Keycloak
-  # Пробуем получить IP из docker network или используем localhost
-  local server_ip="localhost"
-  if docker network inspect "$DOCKER_NETWORK" >/dev/null 2>&1; then
-    local network_ip
-    network_ip="$(docker network inspect "$DOCKER_NETWORK" --format '{{range .IPAM.Config}}{{.Gateway}}{{end}}' 2>/dev/null | head -1 || echo "")"
-    if [ -n "$network_ip" ] && [ "$network_ip" != "<no value>" ]; then
-      server_ip="$network_ip"
-    else
-      # Пробуем получить IP хоста из контейнера
-      local host_ip
-      host_ip="$(docker exec unicnetkeycloak sh -c 'ip route | grep default | awk '\''{print $3}'\'' || echo ""' 2>/dev/null | head -1 || echo "")"
-      if [ -n "$host_ip" ]; then
-        server_ip="$host_ip"
-      fi
-    fi
-  fi
+  # Внешний адрес хоста (не docker gateway)
+  local server_ip
+  server_ip="$(detect_access_host)"
   
   local -a candidates=()
   [ -n "$http_port" ]  && candidates+=("http://${server_ip}:${http_port}")
@@ -1735,28 +1764,21 @@ step_summary() {
   echo; sep
   echo "ГОТОВО ✅ Проверьте доступы:"
   
-  # Определяем IP адрес для доступа к сервисам
-  local server_ip="localhost"
-  if docker network inspect "$DOCKER_NETWORK" >/dev/null 2>&1; then
-    local network_ip
-    network_ip="$(docker network inspect "$DOCKER_NETWORK" --format '{{range .IPAM.Config}}{{.Gateway}}{{end}}' 2>/dev/null | head -1 || echo "")"
-    if [ -n "$network_ip" ] && [ "$network_ip" != "<no value>" ]; then
-      server_ip="$network_ip"
-    else
-      # Пробуем получить IP хоста из контейнера
-      local host_ip
-      host_ip="$(docker exec unicnetkeycloak sh -c 'ip route | grep default | awk '\''{print $3}'\'' || echo ""' 2>/dev/null | head -1 || echo "")"
-      if [ -n "$host_ip" ]; then
-        server_ip="$host_ip"
-      fi
-    fi
-  fi
+  local server_ip
+  server_ip="$(detect_access_host)"
   
-  echo "  Приложение:      http://${server_ip}:${APP_PORT_DEFAULT}"
+  echo "  Приложение (local):      http://localhost:${APP_PORT_DEFAULT}"
+  if [ "$server_ip" != "localhost" ]; then
+    echo "  Приложение (по IP):      http://${server_ip}:${APP_PORT_DEFAULT}"
+  fi
   # Получаем актуальные credentials из контейнера для вывода
   local kc_admin_display
   kc_admin_display="$(_get_kc_env KEYCLOAK_ADMIN_USER "${KC_ADMIN:-${BASE_USER_DEFAULT}}" 2>/dev/null || echo "${KC_ADMIN:-${BASE_USER_DEFAULT}}")"
-  echo "  Keycloak Admin:  ${kc_admin_display} / *** (из контейнера)  (${KC_URL:-http://${server_ip}:${KC_PORT:-$KC_PORT_DEFAULT}})"
+  local kc_url_display="${KC_URL:-http://${server_ip}:${KC_PORT:-$KC_PORT_DEFAULT}}"
+  if [ "$server_ip" = "localhost" ]; then
+    kc_url_display="http://localhost:${KC_PORT:-$KC_PORT_DEFAULT}"
+  fi
+  echo "  Keycloak Admin:  ${kc_admin_display} / *** (из контейнера)  (${kc_url_display})"
   echo "  Realm:           ${REALM}"
   echo "  User:            ${NEW_USER} / ${NEW_USER_PASS}"
   if [ -n "$ASSIGNED_GROUPS" ] && [ "$ASSIGNED_GROUPS" != "<не присвоены>" ] && [ "$ASSIGNED_GROUPS" != "<группы будут назначены при импорте realm>" ]; then
@@ -1768,7 +1790,10 @@ step_summary() {
   else
     echo "  Groups:          ${ASSIGNED_GROUPS:-<не присвоены>}"
   fi
-  echo "  Vault Swagger:   http://${server_ip}:8200/swagger/index.html"
+  echo "  Vault Swagger:   http://localhost:8200/swagger/index.html"
+  if [ "$server_ip" != "localhost" ]; then
+    echo "                   http://${server_ip}:8200/swagger/index.html"
+  fi
   sep
 }
 
