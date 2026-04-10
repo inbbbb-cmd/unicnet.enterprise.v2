@@ -166,7 +166,7 @@ graph TD
 1. **Клонируйте репозиторий**: Выполните клонирование репозитория `unicnet.enterprise`:
 
    ```bash
-   git clone https://github.com/rightsoftware-ru/unicnet.enterprise.git
+   git clone https://github.com/inbbbb-cmd/unicnet.enterprise.v1.git
    cd unicnet.enterprise
    ```
 
@@ -261,7 +261,7 @@ graph TD
 Клонируйте репозиторий `unicnet.enterprise`:
 
 ```bash
-git clone https://github.com/rightsoftware-ru/unicnet.enterprise.git
+git clone https://github.com/inbbbb-cmd/unicnet.enterprise.v1.git
 cd unicnet.enterprise
 ```
 
