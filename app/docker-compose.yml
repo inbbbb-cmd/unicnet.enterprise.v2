@@ -29,7 +29,10 @@
 #   UniCommLicenseData=default_license_data
 #
 # Router (unicnet.router):
-#   RouterCidr      - CIDR сети расположения router (адрес + маска).
+#   RouterCidr      - CIDR локальной сети(ей), которую обслуживает UnicNet router.
+#                     Для установки за NAT указывайте внутренний (RFC1918) CIDR, а не внешний WAN-адрес.
+#                     Поддерживается список через запятую без пробелов, например:
+#                     10.10.0.0/16,192.168.100.0/24,172.20.30.0/24
 #                     Как узнать на сервере: ip addr или ip route (inet X.X.X.X/YY → сеть X.X.X.0/YY).
 
 networks:
@@ -250,7 +253,7 @@ services:
     environment:
       - api.vault.url=http://unicnetvault:80/
       - api.logger.url=http://unicnetlogger:8080/
-      # RouterCidr: как узнать на сервере — ip addr или ip route
+      # RouterCidr: для NAT указывайте локальные CIDR (можно несколько через запятую)
       - RouterCidr=${RouterCidr:-}
       - UniCommLicenseData=${UniCommLicenseData:-default_license_data}
     deploy:
