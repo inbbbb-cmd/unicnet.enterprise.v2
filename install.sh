@@ -7,7 +7,7 @@ set -Euo pipefail
 # =========================
 # Config / Defaults
 # =========================
-REPO_URL="${REPO_URL:-https://github.com/inbbbb-cmd/unicnet.enterprise.v1.git}"
+REPO_URL="${REPO_URL:-https://github.com/inbbbb-cmd/unicnet.enterprise.v2.git}"
 REPO_DIR="${REPO_DIR:-unicnet.enterprise}"
 COMPOSE_FILE="${COMPOSE_FILE:-app/docker-compose.yml}"
 ENV_FILE="${ENV_FILE:-app/.env}"
