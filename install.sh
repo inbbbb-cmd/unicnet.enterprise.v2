@@ -828,6 +828,11 @@ step_get_vault_token() {
 step_create_vault_secret() {
   local container_name="unicnetvault"
   local vault_secret_id="UNFrontV2"
+
+  need_cmd jq || {
+    err "Для безопасной сборки JSON требуется jq"
+    return 1
+  }
   
   # Проверяем, что контейнер запущен
   if ! docker ps --format '{{.Names}}' | grep -q "^${container_name}$"; then
@@ -870,28 +875,45 @@ step_create_vault_secret() {
   info "  Router:   ${router_hostport}"
   
   local json_payload
-  json_payload=$(cat <<EOF
-{
-  "id": "${vault_secret_id}",
-  "name": "${vault_secret_id}",
-  "type": "Password",
-  "data": "Empty",
-  "metadata": {
-    "api.keycloak.url": "${keycloak_url}",
-    "api.license.url": "http://unicnet.license",
-    "api.backend.url": "${backend_url}",
-    "api.logger.url": "${logger_url}",
-    "api.syslog.url": "${syslog_url}",
-    "KeyCloak.AdmUn": "${kc_admin_user}",
-    "KeyCloak.AdmPw": "${kc_admin_pass}",
-    "KeyCloak.Realm": "${kc_realm}",
-    "RouterHotSpot": "${router_hostport}"
-  },
-  "tags": [],
-  "expiresAt": "2050-12-31T23:59:59.999Z"
-}
-EOF
-)
+  json_payload="$(
+    jq -n \
+      --arg secret_id "${vault_secret_id}" \
+      --arg keycloak_url "${keycloak_url}" \
+      --arg backend_url "${backend_url}" \
+      --arg logger_url "${logger_url}" \
+      --arg syslog_url "${syslog_url}" \
+      --arg kc_admin_user "${kc_admin_user}" \
+      --arg kc_admin_pass "${kc_admin_pass}" \
+      --arg kc_realm "${kc_realm}" \
+      --arg router_hostport "${router_hostport}" \
+      '{
+        id: $secret_id,
+        name: $secret_id,
+        type: "Password",
+        data: "Empty",
+        metadata: {
+          "api.keycloak.url": $keycloak_url,
+          "api.license.url": "http://unicnet.license",
+          "api.backend.url": $backend_url,
+          "api.logger.url": $logger_url,
+          "api.syslog.url": $syslog_url,
+          "KeyCloak.AdmUn": $kc_admin_user,
+          "KeyCloak.AdmPw": $kc_admin_pass,
+          "KeyCloak.Realm": $kc_realm,
+          "RouterHotSpot": $router_hostport
+        },
+        tags: [],
+        expiresAt: "2050-12-31T23:59:59.999Z"
+      }'
+  )" || {
+    err "Не удалось сформировать JSON payload через jq"
+    return 1
+  }
+
+  if ! echo "$json_payload" | jq empty >/dev/null 2>&1; then
+    err "Сформированный JSON payload некорректен, отправка в Vault отменена"
+    return 1
+  fi
   
   log "Создаю секрет в Vault с ID: ${vault_secret_id}"
   
