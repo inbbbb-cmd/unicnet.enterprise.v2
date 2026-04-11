@@ -35,7 +35,7 @@ export KEYCLOAK_ADMIN_PASSWORD=admin123
 
 # Лицензия (используется всеми сервисами).
 # Заполняйте значение прямо в этом файле и затем применяйте: source export_variables.txt
-export UniCommLicenseData="<ваша_лицензия>"
+export UniCommLicenseData=
 # Если нужно НЕ перезаписывать заранее экспортированное значение, используйте вместо строки выше:
 # export UniCommLicenseData="${UniCommLicenseData:-}"
 
@@ -45,7 +45,7 @@ export UniCommLicenseData="<ваша_лицензия>"
 # 10.10.0.0/16,192.168.100.0/24,172.20.30.0/24
 # RouterCidr заполняйте прямо в этом файле и затем выполняйте source export_variables.txt
 # Пример для одной подсети:
-export RouterCidr="192.168.1.0/24"
+export RouterCidr=
 # Если подсетей несколько:
 # export RouterCidr="10.10.0.0/16,192.168.100.0/24"
 # Как узнать CIDR на сервере: ip addr или ip route.
