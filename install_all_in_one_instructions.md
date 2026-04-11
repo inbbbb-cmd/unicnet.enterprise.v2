@@ -211,6 +211,8 @@ graph TD
       source export_variables.txt
       ```
 
+      > **⚠️ ВАЖНО**: Если вы сначала сделали `export UniCommLicenseData="..."`, а потом выполнили `source export_variables.txt` с пустым `UniCommLicenseData`, лицензия может перезаписаться пустым значением. В этом репозитории `export_variables.txt` настроен так, чтобы сохранять уже экспортированное значение, но всё равно проверяйте переменную после `source`.
+
       Или:
 
       ```bash
@@ -350,6 +352,8 @@ cr.yandex
    ```bash
    source export_variables.txt
    ```
+
+   > **⚠️ ВАЖНО**: Проверяйте, что после `source` значение лицензии не стало пустым: `echo $UniCommLicenseData`.
 
    Или:
 
