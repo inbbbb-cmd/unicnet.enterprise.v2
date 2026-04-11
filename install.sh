@@ -973,8 +973,16 @@ step_create_vault_secret() {
   local vault_get_url="${vault_api_url}/${vault_secret_id}"
   local response
   local temp_json
+  local payload_hash
   temp_json="$(mktemp)"
   echo "$json_payload" > "$temp_json"
+  if command -v sha256sum >/dev/null 2>&1; then
+    payload_hash="$(printf "%s" "$json_payload" | sha256sum | awk '{print $1}')"
+  elif command -v shasum >/dev/null 2>&1; then
+    payload_hash="$(printf "%s" "$json_payload" | shasum -a 256 | awk '{print $1}')"
+  else
+    payload_hash="sha256-unavailable"
+  fi
 
   # Предварительная проверка существования секрета.
   # В некоторых версиях Vault повторное создание может отдавать 400 вместо 409.
@@ -995,7 +1003,7 @@ step_create_vault_secret() {
     return 1
   }
   
-  response="$(docker exec -e VAULT_TOKEN="${VAULT_TOKEN}" "${container_name}" sh -c 'curl -s -w "\nHTTP_CODE:%{http_code}" -X POST "http://localhost:80/api/Secrets" \
+  response="$(docker exec -e VAULT_TOKEN="${VAULT_TOKEN}" "${container_name}" sh -c 'curl -s -i -w "\nHTTP_CODE:%{http_code}" -X POST "http://localhost:80/api/Secrets" \
     -H "accept: text/plain" \
     -H "Authorization: Bearer ${VAULT_TOKEN}" \
     -H "Content-Type: application/json" \
@@ -1013,6 +1021,17 @@ step_create_vault_secret() {
   http_code="$(echo "$response" | grep "HTTP_CODE:" | cut -d: -f2 || echo "")"
   local response_body
   response_body="$(echo "$response" | sed '/HTTP_CODE:/d')"
+  local response_headers request_id_lines
+  response_headers="$(printf "%s\n" "$response_body" | sed -n '1,/^\r\{0,1\}$/p')"
+  request_id_lines="$(printf "%s\n" "$response_headers" | tr -d '\r' | awk 'BEGIN{IGNORECASE=1} /^[[:space:]]*[[:alnum:]-]+:[[:space:]]*/ { if ($0 ~ /(correlation|request)[-_ ]?id/) print }')"
+  response_body="$(printf "%s\n" "$response_body" | awk 'BEGIN{body=0} { line=$0; gsub(/\r/, "", line); if (body==0 && line=="") { body=1; next } if (body==1) print }')"
+
+  if [ -n "$request_id_lines" ]; then
+    info "Correlation/Request ID из заголовков ответа:"
+    echo "$request_id_lines" | sed 's/^/  /'
+  else
+    warn "В заголовках ответа не найден Correlation/Request ID"
+  fi
   
   if [ "$http_code" = "200" ] || [ "$http_code" = "201" ]; then
     log "Секрет '${vault_secret_id}' успешно создан в Vault"
@@ -1026,6 +1045,11 @@ step_create_vault_secret() {
     return 0
   else
     err "Ошибка создания секрета в Vault, HTTP ${http_code:-unknown}"
+    err "Payload SHA256: ${payload_hash}"
+    if [ "$http_code" = "400" ] || [[ "$http_code" =~ ^5[0-9][0-9]$ ]]; then
+      err "HTTP ${http_code}: показываю последние 200 строк логов контейнера ${container_name}"
+      docker logs "${container_name}" --tail 200 2>&1 | sed 's/^/  /'
+    fi
     if [ -n "$response_body" ]; then
       err "Ответ сервера:"
       echo "$response_body" | sed 's/^/  /' | head -20
