@@ -211,6 +211,65 @@ http_ok() {
   case "$code" in 2*|3*) return 0 ;; *) return 1 ;; esac
 }
 
+wait_vault_ready() {
+  local container_name="${1:-unicnetvault}"
+  local timeout_sec="${2:-90}"
+  local interval_sec="${3:-3}"
+  local started_at elapsed
+  local swagger_url="http://localhost:80/swagger/index.html"
+  local token_probe_url="http://localhost:80/api/token/0f8e160416b94225a73f86ac23b9118b?username=UNFrontV2"
+  local http_code=""
+  local probe=""
+  local probe_script='
+probe_url() {
+  local url="$1"
+  if command -v curl >/dev/null 2>&1; then
+    curl -s -o /dev/null -w "%{http_code}" --connect-timeout 2 --max-time 5 "$url" || true
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q -T 5 --spider --server-response "$url" 2>&1 | awk "/^  HTTP\\// {code=\$2} END {print code}" || true
+  else
+    echo "000"
+  fi
+}
+code="$(probe_url "'"${swagger_url}"'")"
+[ -z "$code" ] && code="000"
+if [ "$code" != "000" ] && ! echo "$code" | grep -q "^5"; then
+  echo "$code"
+  exit 0
+fi
+code="$(probe_url "'"${token_probe_url}"'")"
+[ -z "$code" ] && code="000"
+if [ "$code" != "000" ] && ! echo "$code" | grep -q "^5"; then
+  echo "$code"
+  exit 0
+fi
+echo "$code"
+exit 1
+'
+
+  if ! docker ps --format '{{.Names}}' | grep -q "^${container_name}$"; then
+    err "Контейнер Vault ${container_name} не запущен"
+    return 1
+  fi
+
+  log "Ожидаю готовности Vault (${container_name}) до ${timeout_sec} сек..."
+  started_at="$(date +%s)"
+  while true; do
+    if probe="$(docker exec "${container_name}" sh -c "$probe_script" 2>/dev/null)"; then
+      http_code="$(echo "$probe" | tr -d '\r\n' | sed 's/[^0-9].*$//')"
+      log "Vault отвечает (HTTP ${http_code:-unknown}, не 5xx). Продолжаю."
+      return 0
+    fi
+
+    elapsed="$(( $(date +%s) - started_at ))"
+    if [ "$elapsed" -ge "$timeout_sec" ]; then
+      err "Vault не стал готов за ${timeout_sec} сек (последний HTTP: ${probe:-unknown})"
+      return 1
+    fi
+    sleep "$interval_sec"
+  done
+}
+
 # =========================
 # Проверка переменных окружения (из export_variables.txt)
 # Docker Compose берёт переменные из окружения. Перед запуском: source export_variables.txt
@@ -712,6 +771,8 @@ step_get_vault_token() {
     err "Контейнер Vault ${container_name} не запущен"
     return 1
   fi
+
+  wait_vault_ready "${container_name}" 90 3 || return 1
   
   local vault_port="80"
   local vault_url="http://localhost:${vault_port}"
@@ -830,6 +891,8 @@ step_create_vault_secret() {
   local container_name="unicnetvault"
   local vault_secret_id="UNFrontV2"
   local vault_api_url="http://localhost:80/api/Secrets"
+
+  wait_vault_ready "${container_name}" 90 3 || return 1
 
   _sanitize_value() {
     printf "%s" "$1" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
