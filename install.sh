@@ -61,6 +61,7 @@ CURL_OPTS=()
 ACCESS_TOKEN=""
 VAULT_TOKEN=""
 AUTO_INSTALL="${AUTO_INSTALL:-false}"  # Флаг автоматической установки (без пауз)
+VAULT_RECOVERY_ON_NRE="${VAULT_RECOVERY_ON_NRE:-false}"  # Автовосстановление Vault при HTTP 400 + NullReferenceException
 
 # =========================
 # UI helpers
@@ -840,6 +841,78 @@ step_create_vault_secret() {
     [ -z "$v" ] || [ "$v" = "null" ] || [ "$v" = "undefined" ] || [ "$v" = "\"\"" ]
   }
 
+  _flag_is_true() {
+    local v
+    v="$(printf "%s" "${1:-}" | tr '[:upper:]' '[:lower:]')"
+    [ "$v" = "1" ] || [ "$v" = "true" ] || [ "$v" = "yes" ] || [ "$v" = "y" ]
+  }
+
+  _parse_mongocs_db() {
+    local mongocs="$1"
+    echo "$mongocs" | sed -n 's|mongodb://[^/]*/\([^?]*\).*|\1|p'
+  }
+
+  _run_vault_recovery() {
+    local mongo_container="unicnetmongo"
+    local mongo_cli="mongo"
+    local mongo_root_user mongo_root_pass vault_mongocs vault_db backup_collection
+    local js_file js_file_in_container recovery_output
+
+    if ! docker ps --format '{{.Names}}' | grep -q "^${mongo_container}$"; then
+      err "Recovery прерван: контейнер MongoDB ${mongo_container} не запущен"
+      return 1
+    fi
+
+    if docker exec "${mongo_container}" sh -c "command -v mongosh >/dev/null 2>&1" >/dev/null 2>&1; then
+      mongo_cli="mongosh"
+    fi
+
+    mongo_root_user="$(docker exec "${mongo_container}" sh -c 'printenv MONGO_INITDB_ROOT_USERNAME' 2>/dev/null | tr -d '\r' || true)"
+    mongo_root_pass="$(docker exec "${mongo_container}" sh -c 'printenv MONGO_INITDB_ROOT_PASSWORD' 2>/dev/null | tr -d '\r' || true)"
+    mongo_root_user="${mongo_root_user:-root}"
+    mongo_root_pass="${mongo_root_pass:-mongo123}"
+
+    vault_mongocs="$(docker exec "${container_name}" sh -c 'printenv MongoCS' 2>/dev/null | tr -d '\r' || true)"
+    vault_db="$(_parse_mongocs_db "$vault_mongocs")"
+    vault_db="${vault_db:-vault_db}"
+    backup_collection="Secrets_backup_$(date +%Y%m%d_%H%M%S)"
+
+    js_file="$(mktemp)"
+    js_file_in_container="/tmp/vault_recovery_$$.js"
+    cat >"${js_file}" <<EOF
+var targetDb = "${vault_db}";
+var sourceCollection = "Secrets";
+var backupCollection = "${backup_collection}";
+var dbRef = db.getSiblingDB(targetDb);
+var names = dbRef.getCollectionNames();
+if (names.indexOf(sourceCollection) === -1) {
+  print("RECOVERY_INFO: collection Secrets отсутствует в БД " + targetDb);
+} else {
+  dbRef[sourceCollection].renameCollection(backupCollection, true);
+  print("RECOVERY_DONE: " + targetDb + "." + sourceCollection + " -> " + targetDb + "." + backupCollection);
+}
+EOF
+
+    docker cp "${js_file}" "${mongo_container}:${js_file_in_container}" >/dev/null 2>&1 || {
+      rm -f "${js_file}"
+      err "Recovery прерван: не удалось скопировать JS скрипт в ${mongo_container}"
+      return 1
+    }
+    rm -f "${js_file}"
+
+    recovery_output="$(docker exec "${mongo_container}" "${mongo_cli}" admin -u "${mongo_root_user}" -p "${mongo_root_pass}" --authenticationDatabase admin --quiet "${js_file_in_container}" 2>&1)" || {
+      docker exec "${mongo_container}" rm -f "${js_file_in_container}" >/dev/null 2>&1 || true
+      err "Recovery прерван: ошибка выполнения mongo-скрипта"
+      echo "${recovery_output}" | sed 's/^/  /'
+      return 1
+    }
+    docker exec "${mongo_container}" rm -f "${js_file_in_container}" >/dev/null 2>&1 || true
+
+    log "Recovery: резервная копия/переименование коллекции Secrets выполнены"
+    echo "${recovery_output}" | sed 's/^/  /'
+    return 0
+  }
+
   need_cmd jq || {
     err "Для безопасной сборки JSON требуется jq"
     return 1
@@ -971,7 +1044,6 @@ step_create_vault_secret() {
   echo
   
   local vault_get_url="${vault_api_url}/${vault_secret_id}"
-  local response
   local temp_json
   local payload_hash
   temp_json="$(mktemp)"
@@ -984,39 +1056,50 @@ step_create_vault_secret() {
     payload_hash="sha256-unavailable"
   fi
 
-  # Предварительная проверка существования секрета.
-  # В некоторых версиях Vault повторное создание может отдавать 400 вместо 409.
-  local exists_response exists_code
-  exists_response="$(docker exec -e VAULT_TOKEN="${VAULT_TOKEN}" "${container_name}" sh -c 'curl -s -w "\nHTTP_CODE:%{http_code}" -X GET "'"${vault_get_url}"'" \
-    -H "accept: text/plain" \
-    -H "Authorization: Bearer ${VAULT_TOKEN}"' 2>&1)" || true
-  exists_code="$(echo "$exists_response" | grep "HTTP_CODE:" | cut -d: -f2 || echo "")"
-  if [ "$exists_code" = "200" ]; then
+  _vault_create_secret_request() {
+    local out_var="$1"
+    local exists_response exists_code post_response
+
+    exists_response="$(docker exec -e VAULT_TOKEN="${VAULT_TOKEN}" "${container_name}" sh -c 'curl -s -w "\nHTTP_CODE:%{http_code}" -X GET "'"${vault_get_url}"'" \
+      -H "accept: text/plain" \
+      -H "Authorization: Bearer ${VAULT_TOKEN}"' 2>&1)" || true
+    exists_code="$(echo "$exists_response" | grep "HTTP_CODE:" | cut -d: -f2 || echo "")"
+    if [ "$exists_code" = "200" ]; then
+      printf -v "$out_var" "%s" "ALREADY_EXISTS"
+      return 0
+    fi
+
+    docker cp "$temp_json" "${container_name}:/tmp/vault_secret.json" >/dev/null 2>&1 || {
+      err "Не удалось скопировать JSON в контейнер"
+      return 1
+    }
+
+    post_response="$(docker exec -e VAULT_TOKEN="${VAULT_TOKEN}" "${container_name}" sh -c 'curl -s -i -w "\nHTTP_CODE:%{http_code}" -X POST "http://localhost:80/api/Secrets" \
+      -H "accept: text/plain" \
+      -H "Authorization: Bearer ${VAULT_TOKEN}" \
+      -H "Content-Type: application/json" \
+      -d @/tmp/vault_secret.json' 2>&1)" || {
+      docker exec "${container_name}" rm -f /tmp/vault_secret.json >/dev/null 2>&1 || true
+      err "Ошибка выполнения curl запроса в контейнере"
+      return 1
+    }
+    docker exec "${container_name}" rm -f /tmp/vault_secret.json >/dev/null 2>&1 || true
+    printf -v "$out_var" "%s" "$post_response"
+    return 0
+  }
+
+  local response
+  _vault_create_secret_request response || {
+    rm -f "$temp_json"
+    return 1
+  }
+
+  if [ "$response" = "ALREADY_EXISTS" ]; then
     warn "Секрет '${vault_secret_id}' уже существует в Vault (GET ${vault_get_url} -> 200)"
     rm -f "$temp_json"
     return 0
   fi
-  
-  docker cp "$temp_json" "${container_name}:/tmp/vault_secret.json" >/dev/null 2>&1 || {
-    rm -f "$temp_json"
-    err "Не удалось скопировать JSON в контейнер"
-    return 1
-  }
-  
-  response="$(docker exec -e VAULT_TOKEN="${VAULT_TOKEN}" "${container_name}" sh -c 'curl -s -i -w "\nHTTP_CODE:%{http_code}" -X POST "http://localhost:80/api/Secrets" \
-    -H "accept: text/plain" \
-    -H "Authorization: Bearer ${VAULT_TOKEN}" \
-    -H "Content-Type: application/json" \
-    -d @/tmp/vault_secret.json' 2>&1)" || {
-    docker exec "${container_name}" rm -f /tmp/vault_secret.json >/dev/null 2>&1 || true
-    rm -f "$temp_json"
-    err "Ошибка выполнения curl запроса в контейнере"
-    return 1
-  }
-  
-  docker exec "${container_name}" rm -f /tmp/vault_secret.json >/dev/null 2>&1 || true
-  rm -f "$temp_json"
-  
+
   local http_code
   http_code="$(echo "$response" | grep "HTTP_CODE:" | cut -d: -f2 || echo "")"
   local response_body
@@ -1025,6 +1108,58 @@ step_create_vault_secret() {
   response_headers="$(printf "%s\n" "$response_body" | sed -n '1,/^\r\{0,1\}$/p')"
   request_id_lines="$(printf "%s\n" "$response_headers" | tr -d '\r' | awk 'BEGIN{IGNORECASE=1} /^[[:space:]]*[[:alnum:]-]+:[[:space:]]*/ { if ($0 ~ /(correlation|request)[-_ ]?id/) print }')"
   response_body="$(printf "%s\n" "$response_body" | awk 'BEGIN{body=0} { line=$0; gsub(/\r/, "", line); if (body==0 && line=="") { body=1; next } if (body==1) print }')"
+
+  local recovery_performed=0
+  if [ "$http_code" = "400" ] && printf "%s" "$response_body" | grep -qi "Object reference not set"; then
+    if _flag_is_true "${VAULT_RECOVERY_ON_NRE:-false}"; then
+      local run_recovery="false"
+      if [ "${AUTO_INSTALL:-false}" = "true" ]; then
+        warn "VAULT_RECOVERY_ON_NRE=true и AUTO_INSTALL=true: recovery запускается автоматически"
+        run_recovery="true"
+      else
+        if ask_yes_no "Vault вернул HTTP 400 (Object reference not set...). Выполнить recovery (backup/rename Secrets, restart unicnetvault, повторить запрос)?" "Y"; then
+          run_recovery="true"
+        fi
+      fi
+
+      if [ "$run_recovery" = "true" ]; then
+        _run_vault_recovery || {
+          rm -f "$temp_json"
+          return 1
+        }
+        log "Recovery: перезапускаю контейнер ${container_name}"
+        docker restart "${container_name}" >/dev/null || {
+          rm -f "$temp_json"
+          err "Не удалось перезапустить контейнер ${container_name}"
+          return 1
+        }
+        sleep 5
+        step_get_vault_token || {
+          rm -f "$temp_json"
+          err "Recovery: не удалось получить новый токен Vault после перезапуска"
+          return 1
+        }
+        VAULT_TOKEN="$(_sanitize_value "${VAULT_TOKEN:-}")"
+        _vault_create_secret_request response || {
+          rm -f "$temp_json"
+          return 1
+        }
+        recovery_performed=1
+        if [ "$response" = "ALREADY_EXISTS" ]; then
+          warn "Recovery: секрет '${vault_secret_id}' уже существует после повторной проверки"
+          rm -f "$temp_json"
+          return 0
+        fi
+        http_code="$(echo "$response" | grep "HTTP_CODE:" | cut -d: -f2 || echo "")"
+        response_body="$(echo "$response" | sed '/HTTP_CODE:/d')"
+        response_headers="$(printf "%s\n" "$response_body" | sed -n '1,/^\r\{0,1\}$/p')"
+        request_id_lines="$(printf "%s\n" "$response_headers" | tr -d '\r' | awk 'BEGIN{IGNORECASE=1} /^[[:space:]]*[[:alnum:]-]+:[[:space:]]*/ { if ($0 ~ /(correlation|request)[-_ ]?id/) print }')"
+        response_body="$(printf "%s\n" "$response_body" | awk 'BEGIN{body=0} { line=$0; gsub(/\r/, "", line); if (body==0 && line=="") { body=1; next } if (body==1) print }')"
+      fi
+    else
+      warn "Обнаружен HTTP 400/Object reference not set, но recovery отключен (VAULT_RECOVERY_ON_NRE=${VAULT_RECOVERY_ON_NRE:-false})"
+    fi
+  fi
 
   if [ -n "$request_id_lines" ]; then
     info "Correlation/Request ID из заголовков ответа:"
@@ -1035,13 +1170,21 @@ step_create_vault_secret() {
   
   if [ "$http_code" = "200" ] || [ "$http_code" = "201" ]; then
     log "Секрет '${vault_secret_id}' успешно создан в Vault"
+    if [ "$recovery_performed" -eq 1 ]; then
+      log "Recovery выполнен автоматически: backup/rename коллекции Secrets, restart unicnetvault, повтор GET/POST"
+    fi
     if [ -n "$response_body" ]; then
       info "Ответ сервера:"
       echo "$response_body" | sed 's/^/  /' | head -10
     fi
+    rm -f "$temp_json"
     return 0
   elif [ "$http_code" = "409" ]; then
     warn "Секрет '${vault_secret_id}' уже существует в Vault"
+    if [ "$recovery_performed" -eq 1 ]; then
+      log "Recovery выполнен автоматически: backup/rename коллекции Secrets, restart unicnetvault, повтор GET/POST"
+    fi
+    rm -f "$temp_json"
     return 0
   else
     err "Ошибка создания секрета в Vault, HTTP ${http_code:-unknown}"
@@ -1054,6 +1197,7 @@ step_create_vault_secret() {
       err "Ответ сервера:"
       echo "$response_body" | sed 's/^/  /' | head -20
     fi
+    rm -f "$temp_json"
     return 1
   fi
 }
