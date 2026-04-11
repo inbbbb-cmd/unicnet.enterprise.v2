@@ -859,6 +859,17 @@ step_create_vault_secret() {
   info "  Admin User: ${kc_admin_user}"
   info "  Admin Pass: ********"
   info "  Realm: ${kc_realm}"
+
+  # Проверяем обязательные поля перед отправкой в Vault.
+  # Иначе Vault может отвечать 400 с "Object reference not set to an instance of an object."
+  if [ -z "${kc_admin_user}" ] || [ -z "${kc_admin_pass}" ] || [ -z "${kc_realm}" ]; then
+    err "Не заполнены обязательные поля для секрета Vault:"
+    [ -z "${kc_admin_user}" ] && err "  - KeyCloak.AdmUn (пользователь админа Keycloak)"
+    [ -z "${kc_admin_pass}" ] && err "  - KeyCloak.AdmPw (пароль админа Keycloak)"
+    [ -z "${kc_realm}" ] && err "  - KeyCloak.Realm (realm Keycloak)"
+    err "Проверьте переменные KEYCLOAK_ADMIN_USER / KEYCLOAK_ADMIN_PASSWORD и параметр REALM."
+    return 1
+  fi
   
   # Формируем URL с внутренними именами сервисов и портами Docker сети
   local keycloak_url="http://unicnetkeycloak:8080/"
@@ -930,10 +941,24 @@ step_create_vault_secret() {
   echo
   
   local vault_api_url="http://localhost:80/api/Secrets"
+  local vault_get_url="${vault_api_url}/${vault_secret_id}"
   local response
   local temp_json
   temp_json="$(mktemp)"
   echo "$json_payload" > "$temp_json"
+
+  # Предварительная проверка существования секрета.
+  # В некоторых версиях Vault повторное создание может отдавать 400 вместо 409.
+  local exists_response exists_code
+  exists_response="$(docker exec -e VAULT_TOKEN="${VAULT_TOKEN}" "${container_name}" sh -c 'curl -s -w "\nHTTP_CODE:%{http_code}" -X GET "'"${vault_get_url}"'" \
+    -H "accept: text/plain" \
+    -H "Authorization: Bearer ${VAULT_TOKEN}"' 2>&1)" || true
+  exists_code="$(echo "$exists_response" | grep "HTTP_CODE:" | cut -d: -f2 || echo "")"
+  if [ "$exists_code" = "200" ]; then
+    warn "Секрет '${vault_secret_id}' уже существует в Vault (GET ${vault_get_url} -> 200)"
+    rm -f "$temp_json"
+    return 0
+  fi
   
   docker cp "$temp_json" "${container_name}:/tmp/vault_secret.json" >/dev/null 2>&1 || {
     rm -f "$temp_json"
