@@ -828,6 +828,17 @@ step_get_vault_token() {
 step_create_vault_secret() {
   local container_name="unicnetvault"
   local vault_secret_id="UNFrontV2"
+  local vault_api_url="http://localhost:80/api/Secrets"
+
+  _sanitize_value() {
+    printf "%s" "$1" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+  }
+
+  _is_empty_like() {
+    local v
+    v="$(_sanitize_value "${1:-}")"
+    [ -z "$v" ] || [ "$v" = "null" ] || [ "$v" = "undefined" ] || [ "$v" = "\"\"" ]
+  }
 
   need_cmd jq || {
     err "Для безопасной сборки JSON требуется jq"
@@ -854,6 +865,10 @@ step_create_vault_secret() {
   kc_admin_user="$(_get_kc_env KEYCLOAK_ADMIN_USER "${KC_ADMIN:-unicnet}")"
   kc_admin_pass="$(_get_kc_env KEYCLOAK_ADMIN_PASSWORD "${KC_PASS:-admin123}")"
   kc_realm="${REALM:-$(_get_kc_env REALM ${REALM_DEFAULT})}"
+  kc_admin_user="$(_sanitize_value "$kc_admin_user")"
+  kc_admin_pass="$(_sanitize_value "$kc_admin_pass")"
+  kc_realm="$(_sanitize_value "$kc_realm")"
+  VAULT_TOKEN="$(_sanitize_value "${VAULT_TOKEN:-}")"
   
   info "Используются данные Keycloak:"
   info "  Admin User: ${kc_admin_user}"
@@ -862,13 +877,28 @@ step_create_vault_secret() {
 
   # Проверяем обязательные поля перед отправкой в Vault.
   # Иначе Vault может отвечать 400 с "Object reference not set to an instance of an object."
-  if [ -z "${kc_admin_user}" ] || [ -z "${kc_admin_pass}" ] || [ -z "${kc_realm}" ]; then
+  if _is_empty_like "${kc_admin_user}" || _is_empty_like "${kc_admin_pass}" || _is_empty_like "${kc_realm}"; then
     err "Не заполнены обязательные поля для секрета Vault:"
-    [ -z "${kc_admin_user}" ] && err "  - KeyCloak.AdmUn (пользователь админа Keycloak)"
-    [ -z "${kc_admin_pass}" ] && err "  - KeyCloak.AdmPw (пароль админа Keycloak)"
-    [ -z "${kc_realm}" ] && err "  - KeyCloak.Realm (realm Keycloak)"
+    _is_empty_like "${kc_admin_user}" && err "  - KeyCloak.AdmUn (пользователь админа Keycloak)"
+    _is_empty_like "${kc_admin_pass}" && err "  - KeyCloak.AdmPw (пароль админа Keycloak)"
+    _is_empty_like "${kc_realm}" && err "  - KeyCloak.Realm (realm Keycloak)"
     err "Проверьте переменные KEYCLOAK_ADMIN_USER / KEYCLOAK_ADMIN_PASSWORD и параметр REALM."
     return 1
+  fi
+
+  # Проверяем токен перед созданием секрета и автоматически обновляем его при необходимости.
+  local token_check_response token_check_code
+  token_check_response="$(docker exec -e VAULT_TOKEN="${VAULT_TOKEN}" "${container_name}" sh -c 'curl -s -o /dev/null -w "HTTP_CODE:%{http_code}" -X GET "'"${vault_api_url}"'" \
+    -H "accept: text/plain" \
+    -H "Authorization: Bearer ${VAULT_TOKEN}"' 2>&1)" || true
+  token_check_code="$(echo "$token_check_response" | sed -n 's/.*HTTP_CODE:\([0-9][0-9][0-9]\).*/\1/p' | head -1)"
+  if [ "$token_check_code" = "401" ] || [ "$token_check_code" = "403" ] || [ -z "$token_check_code" ]; then
+    warn "Текущий VAULT_TOKEN недействителен (HTTP ${token_check_code:-unknown}), запрашиваю новый токен..."
+    step_get_vault_token || {
+      err "Не удалось обновить токен Vault перед созданием секрета"
+      return 1
+    }
+    VAULT_TOKEN="$(_sanitize_value "${VAULT_TOKEN:-}")"
   fi
   
   # Формируем URL с внутренними именами сервисов и портами Docker сети
@@ -940,7 +970,6 @@ step_create_vault_secret() {
   info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   echo
   
-  local vault_api_url="http://localhost:80/api/Secrets"
   local vault_get_url="${vault_api_url}/${vault_secret_id}"
   local response
   local temp_json
